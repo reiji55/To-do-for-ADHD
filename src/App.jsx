@@ -111,13 +111,52 @@ async function authRequest(path, body, accessToken) {
 }
 
 const Auth = {
-  // メールにコードを送る。既存ユーザーでも新規ユーザーでも同じ呼び方でよい。
-  sendCode: (email) => authRequest("/otp", { email, create_user: true }),
-  // 6桁コードを検証し、成功すればセッション（access/refresh token）が返る
+  // メールを送る。固定URLへのリダイレクト先(redirectTo)を渡すと、
+  // 届くメールのリンクがそこへ戻ってくる（＝マジックリンク）。
+  // 同じメールに、テンプレートに {{ .Token }} が入っていれば6桁コードも同梱される。
+  sendAuthEmail: (email, redirectTo) =>
+    authRequest(`/otp?redirect_to=${encodeURIComponent(redirectTo)}`, {
+      email,
+      create_user: true,
+      options: { email_redirect_to: redirectTo },
+    }),
+  // 6桁コードでの確認（クリックできない環境向けの保険として残す）
   verifyCode: (email, token) => authRequest("/verify", { type: "email", email, token }),
   refresh: (refresh_token) => authRequest("/token?grant_type=refresh_token", { refresh_token }),
   logout: (accessToken) => authRequest("/logout", {}, accessToken).catch(() => {}), // 失敗しても致命的ではない
 };
+
+// マジックリンクのクリック後、リダイレクト先のURLハッシュに
+// #access_token=...&refresh_token=... が載って戻ってくる（暗黙フロー）。
+// PKCE（?code=...）は使っていない（/otp呼び出し時に code_challenge を
+// 送っていないため、GoTrueは暗黙フローで発行する）。
+function parseHashSession() {
+  if (typeof window === "undefined") return null;
+  const hash = window.location.hash;
+  if (!hash || hash.length < 2) return null;
+  const params = new URLSearchParams(hash.slice(1));
+  const accessToken = params.get("access_token");
+  const refreshToken = params.get("refresh_token");
+  if (!accessToken || !refreshToken) return null;
+  return {
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + (parseInt(params.get("expires_in"), 10) || 3600) * 1000,
+  };
+}
+
+async function fetchUserEmail(accessToken) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data && data.email) || null;
+  } catch (err) {
+    return null;
+  }
+}
 
 function sessionFromAuthResponse(data) {
   if (!data || !data.access_token) return null;
@@ -1147,12 +1186,13 @@ function LoadingScreen() {
   );
 }
 
-/* 0.5: はじめる（メール→コードの2段階。パスワードなし・毎回は聞かない） */
-function AuthGate({ mode, email, setEmail, code, setCode, busy, error, onSend, onVerify, onResend, onBack }) {
+/* 0.5: はじめる（メール→リンクの2段階。パスワードなし・毎回は聞かない。
+   6桁コードは、リンクが開きにくい環境向けの保険として残す） */
+function AuthGate({ mode, email, setEmail, code, setCode, busy, error, onSend, onVerify, onUseCode, onResend, onBackToEmail, onBackToSent }) {
   if (mode === "code") {
     return (
       <div className="screen-col">
-        <p className="eyebrow">コードを送った</p>
+        <p className="eyebrow">コードで確認する</p>
         <h1 className="headline">確認する</h1>
         <p className="auth-copy">{email} に届いた6桁のコードを入れて。</p>
         <div className="auth-field">
@@ -1169,8 +1209,7 @@ function AuthGate({ mode, email, setEmail, code, setCode, busy, error, onSend, o
         {error && <p className="auth-error">{error}</p>}
         <div className="spacer" />
         <div className="auth-links">
-          <button className="btn-plain" onClick={onBack} disabled={busy}>← メールを変える</button>
-          <button className="btn-plain" onClick={onResend} disabled={busy}>もう一度送る</button>
+          <button className="btn-plain" onClick={onBackToSent} disabled={busy}>← リンク方式にもどる</button>
         </div>
         <div className="bottom-actions">
           <span />
@@ -1179,11 +1218,36 @@ function AuthGate({ mode, email, setEmail, code, setCode, busy, error, onSend, o
       </div>
     );
   }
+
+  if (mode === "sent") {
+    return (
+      <div className="screen-col">
+        <p className="eyebrow">メールを送った</p>
+        <h1 className="headline">リンクを開いて。</h1>
+        <p className="auth-copy">
+          {email} に届いたメールを開いて、リンクをタップすると入れる。
+          スマホでメールを見た場合は、リンクを開いたその画面で続きが始まる
+          （この画面には戻ってこない）。
+        </p>
+        {error && <p className="auth-error">{error}</p>}
+        <div className="spacer" />
+        <div className="auth-links">
+          <button className="btn-plain" onClick={onBackToEmail} disabled={busy}>← メールを変える</button>
+          <button className="btn-plain" onClick={onResend} disabled={busy}>もう一度送る</button>
+        </div>
+        <div className="bottom-actions">
+          <button className="btn-plain" onClick={onUseCode} disabled={busy}>6桁のコードで確認する</button>
+          <span />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="screen-col">
       <p className="eyebrow">はじめる</p>
       <h1 className="headline">Horme</h1>
-      <p className="auth-copy">メールアドレスにコードを送る。パスワードは無い。</p>
+      <p className="auth-copy">メールアドレスにリンクを送る。パスワードは無い。</p>
       <div className="auth-field">
         <input
           autoFocus
@@ -2132,6 +2196,21 @@ export default function HormeApp() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // マジックリンクを開いて戻ってきた直後なら、URLハッシュにトークンが載っている。
+      // これが最優先。見つけたらURLからは消して（残すと再読込のたびに古いトークンで
+      // 上書きしようとしてしまう）、以降は保存済みセッションと同じ扱いにする。
+      const fromLink = parseHashSession();
+      if (fromLink) {
+        try {
+          window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        } catch (err) {}
+        const email = await fetchUserEmail(fromLink.accessToken);
+        const s = { ...fromLink, email };
+        await saveSession(s);
+        if (!cancelled) setSession(s);
+        return;
+      }
+
       const saved = await loadSession();
       if (!saved) { if (!cancelled) setScreen("auth"); return; }
       let s = saved;
@@ -2239,13 +2318,16 @@ export default function HormeApp() {
   }, [captures, dataReady, session]);
 
   /* 認証まわりの操作 */
-  const handleSendCode = useCallback(async () => {
+  const handleSendLink = useCallback(async () => {
     const email = authEmail.trim();
     if (!email) return;
     setAuthBusy(true); setAuthError(null);
     try {
-      await Auth.sendCode(email);
-      setAuthScreen("code");
+      // 固定URLへ戻ってくるように redirect_to を渡す。ローカルでもVercelでも、
+      // 今開いている場所がそのままリンクの戻り先になる。
+      const redirectTo = window.location.origin + window.location.pathname;
+      await Auth.sendAuthEmail(email, redirectTo);
+      setAuthScreen("sent");
     } catch (err) {
       setAuthError(err.message);
     } finally {
@@ -2269,8 +2351,10 @@ export default function HormeApp() {
     }
   }, [authEmail, authCode]);
 
-  const handleResendCode = useCallback(() => { setAuthCode(""); setAuthError(null); handleSendCode(); }, [handleSendCode]);
+  const handleResend = useCallback(() => { setAuthError(null); handleSendLink(); }, [handleSendLink]);
+  const handleUseCode = useCallback(() => { setAuthScreen("code"); setAuthCode(""); setAuthError(null); }, []);
   const handleBackToEmail = useCallback(() => { setAuthScreen("email"); setAuthCode(""); setAuthError(null); }, []);
+  const handleBackToSent = useCallback(() => { setAuthScreen("sent"); setAuthCode(""); setAuthError(null); }, []);
 
   const handleLogout = useCallback(async () => {
     const token = sessionRef.current && sessionRef.current.accessToken;
@@ -2779,10 +2863,12 @@ export default function HormeApp() {
               setCode={setAuthCode}
               busy={authBusy}
               error={authError}
-              onSend={handleSendCode}
+              onSend={handleSendLink}
               onVerify={handleVerifyCode}
-              onResend={handleResendCode}
-              onBack={handleBackToEmail}
+              onUseCode={handleUseCode}
+              onResend={handleResend}
+              onBackToEmail={handleBackToEmail}
+              onBackToSent={handleBackToSent}
             />
           )}
           {screen === "welcome" && <WelcomeScreen busy={welcomeBusy} onSeed={seedAccount} onSkip={skipSeed} />}
